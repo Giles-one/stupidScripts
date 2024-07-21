@@ -11,7 +11,7 @@ from tree_sitter import Language, Parser
 
 import logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -27,6 +27,12 @@ languageMapping = {
     'c/c++'  : Language('tree-sitter/tree-sitter-cpp/libtree-sitter-cpp.so', 'cpp'),
     'python' : Language('tree-sitter/tree-sitter-python/libtree-sitter-python.so', 'python'),
     'java'   : Language('tree-sitter/tree-sitter-java/libtree-sitter-java.so', 'java'),
+}
+
+souceCodeExtensionMapping = {
+    'c/c++'  : ['.c', '.h', '.cpp', '.hpp', '.cc', '.cxx'],
+    'python' : ['.py'],
+    'java'   : ['.java']
 }
 
 assert os.path.exists(jsonFilesPath)
@@ -47,14 +53,17 @@ def setReadableWritableDir(dirPath):
             file_path = os.path.join(root, file_name)
             os.chmod(file_path, stat.S_IRWXU)  # 用户可读、写、执行
 
-def findJsonFileByDir(dirPath):
-    jsonFiles = []
-    for root, dirs, files in os.walk(dirPath):
+def getFileListsWithExtension(rootPath, extensionLists):
+    assert os.path.exists(rootPath)
+    fileLists = []
+    for root, dirs, files in os.walk(rootPath):
         for file in files:
-            if file.endswith(".json"):
-                jsonFiles.append(os.path.join(root, file))
-    jsonFiles.sort()
-    return jsonFiles
+            if not any(file.endswith(ext) for ext in extensionLists):
+                continue
+            filePath = os.path.join(root, file)
+            fileLists.append(filePath)
+    fileLists.sort()
+    return fileLists
 
 def unzipProject(projectZipFilePath, unzippedProjectPath):
     with zipfile.ZipFile(projectZipFilePath, 'r') as zip_ref:
@@ -96,7 +105,7 @@ def getIdentifierInPython(node):
 
 def getIdentifierByRe(node):
     pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
-    nodeList = node.text.decode().split('\n')
+    nodeList = node.text.decode('utf-8', errors='ignore').split('\n')
     for lineOfCode in nodeList:
         if lineOfCode.strip().startswith('@'):
             continue
@@ -174,7 +183,181 @@ def getFunctionSourceCode(functionName, language, souceCodeFilePath):
 
     return functionSourceCode
 
+def traverseForCalleeIdentifierInCAndCpp(node, calleeIdentifierLists):
 
+    if node.type == "call_expression":
+        for child in node.children:
+            if child.type == "identifier":
+                if not child.text in calleeIdentifierLists:
+                    calleeIdentifierLists.append(child.text)
+                break
+
+    for child in node.children:
+        calleeIdentifierLists = traverseForCalleeIdentifierInCAndCpp(child, calleeIdentifierLists)
+
+    return calleeIdentifierLists
+
+def traverseForCalleeIdentifierInJava(node, calleeIdentifierLists):
+    if node.type == 'method_invocation':
+        identifierLists = []
+        for child in node.children:
+            if child.type == 'identifier':
+                identifierLists.append(child.text)
+        if len(identifierLists) > 0 and (not identifierLists[-1] in calleeIdentifierLists):
+            calleeIdentifierLists.append(identifierLists[-1])
+
+    if node.type == 'object_creation_expression':
+        for child in node.children:
+            if child.type == 'type_identifier' and (not child.text in calleeIdentifierLists):
+                calleeIdentifierLists.append(child.text)
+                break
+
+    for child in node.children:
+        traverseForCalleeIdentifierInJava(child, calleeIdentifierLists)
+    return calleeIdentifierLists
+
+def traverseForCalleeNodeIdentifierInPython(node, identifierLists):
+    if node.type == "identifier":
+        identifierLists.append(node.text)
+
+    for child in node.children:
+        identifierLists = traverseForCalleeNodeIdentifierInPython(child, identifierLists)
+
+    return identifierLists
+def traverseForCalleeIdentifierInPython(node, calleeIdentifierLists):
+    if node.type == "call":
+        for child in node.children:
+            if child.type == "identifier":
+                if not child.text in calleeIdentifierLists:
+                    calleeIdentifierLists.append(child.text)
+                break
+            if child.type == "attribute":
+                identifierLists = []
+                for grandchild in child.children:
+                    if grandchild.type == "identifier":
+                        identifierLists.append(grandchild.text)
+                if len(identifierLists) > 0 and (not identifierLists[-1] in calleeIdentifierLists):
+                    calleeIdentifierLists.append(identifierLists[-1])
+                break
+        return calleeIdentifierLists
+
+    for child in node.children:
+        calleeIdentifierLists = traverseForCalleeIdentifierInPython(child, calleeIdentifierLists)
+
+    return calleeIdentifierLists
+
+
+def traverseTreeForCallTrace(node, callTrace, language):
+
+    if language == 'c/c++':
+        if node.type == "function_definition":
+            # watch point b'static void compile_xclass_matchingpath' in node.text
+            identifier = getIdentifierInCAndCpp(node)
+            if not identifier:
+                identifier = getIdentifierByRe(node)
+            if not identifier:
+                return callTrace
+            calleeIdentifierLists = traverseForCalleeIdentifierInCAndCpp(node, [])
+            callTrace[identifier] = calleeIdentifierLists
+    # Java Handler
+    if language == 'java':
+        if node.type == "constructor_declaration" \
+                or node.type == "method_declaration" \
+                or node.type == "class_declaration":
+            identifier = getIdentifierInJava(node)
+            if not identifier:
+                return callTrace
+            calleeIdentifierLists = traverseForCalleeIdentifierInJava(node, [])
+            callTrace[identifier] = calleeIdentifierLists
+
+
+    # Python Handler
+    if language == 'python':
+        if node.type == "class_definition" \
+                or node.type == "function_definition":
+            identifier = getIdentifierInPython(node)
+            if not identifier:
+                return callTrace
+            calleeIdentifierLists = traverseForCalleeIdentifierInPython(node, [])
+            callTrace[identifier] = calleeIdentifierLists
+
+    for child in node.children:
+        callTrace = traverseTreeForCallTrace(child, callTrace, language)
+
+    return callTrace
+
+def getOneFileFunctionCallTrace(functionName, language, souceCodeFilePath):
+    assert language in languageMapping.keys(), language
+    assert os.path.exists(souceCodeFilePath)
+
+    LANGUAGE = languageMapping.get(language)
+    parser = Parser()
+    parser.set_language(LANGUAGE)
+
+    with open(souceCodeFilePath, 'rb') as souceCodeFile:
+        souceCode = souceCodeFile.read()
+
+    # logger.debug(souceCodeFilePath)
+    tree = parser.parse(souceCode)
+    functionCallTrace = traverseTreeForCallTrace(tree.root_node, {}, language)
+
+    return functionCallTrace
+
+
+def getFunctionCallTraceOneRound(functionName, LANGUAGE, souceCodeFileLists):
+    callerIdentifier = []
+    validSourceCodeFileLists = []
+    for filePath in souceCodeFileLists:
+        with open(filePath, 'rb') as fp:
+            sourceCode = fp.read()
+        if functionName in sourceCode:
+            validSourceCodeFileLists.append(filePath)
+
+    for idx, sourceCodeFilePath in enumerate(validSourceCodeFileLists):
+        # logger.debug('[%d]: %s '% (idx, sourceCodeFilePath))
+        functionCallTrace = getOneFileFunctionCallTrace(functionName, LANGUAGE, sourceCodeFilePath)
+        if not functionCallTrace:
+            continue
+        for caller, callees in functionCallTrace.items():
+            if functionName in callees:
+                callerIdentifier.append(caller)
+
+    return callerIdentifier
+
+def collectCallTrace(functionName, LANGUAGE, souceCodeFileLists, threshold):
+    callerIdentifier = getFunctionCallTraceOneRound(functionName, LANGUAGE, souceCodeFileLists)
+    if not threshold:
+        return callerIdentifier
+
+    # In order to reduce the order of magnitude of the algorithm,
+    # limit each layer of the tree to no more than three nodes.
+    callerIdentifier = callerIdentifier[:3]
+
+    callTrace = []
+    for callerFunctionName in callerIdentifier:
+        callTrace.append(collectCallTrace(callerFunctionName, LANGUAGE, souceCodeFileLists, threshold - 1))
+
+    return {functionName: callTrace}
+
+def getFunctionCallTrace(functionName, LANGUAGE, projectRootPath, threshold):
+    assert os.path.exists(projectRootPath)
+    extensionLists = souceCodeExtensionMapping.get(LANGUAGE)
+    souceCodeFileLists = getFileListsWithExtension(projectRootPath, extensionLists)
+
+    functionName = functionName.encode()
+
+    callTraceCollection = collectCallTrace(functionName, LANGUAGE, souceCodeFileLists, threshold)
+    return callTraceCollection
+
+def decodeTree(data):
+    if isinstance(data, bytes):
+        return data.decode('utf-8')
+    elif isinstance(data, dict):
+        return {decodeTree(key): decodeTree(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [decodeTree(element) for element in data]
+    else:
+        return data
 
 def handleOneJsonFile(jsonFile):
     jsonFileBaseName = os.path.basename(jsonFile)
@@ -227,20 +410,34 @@ def handleOneJsonFile(jsonFile):
         }
         return False, functionInfo
 
-#==========================
-    callTrace = getFucntionCallTrace(functionName, LANGUAGE, souceCodeFilePath, projectRootPath)
+    #==========================
+    projectRootPath = unzippedProjectPath
+    # if LANGUAGE == 'c/c++':
+    errMsg = ''
+    try:
+        callTrace = getFunctionCallTrace(functionName, LANGUAGE, projectRootPath, threshold=3)
+        callTrace = decodeTree(callTrace)
+    except RecursionError:
+        errMsg = 'RecursionError in get function call trace.'
+        callTrace = {}
+
+    # else:
+    #     callTrace = {}
+    #==========================
+
     functionInfo = {
         **jsonData,
         'source_code': souceCode.decode(),
-        'question': jsonFileBaseName,
-        'errMsg': ''
+        'question'   : jsonFileBaseName,
+        'callTrace'  : callTrace,
+        'errMsg'     : errMsg
     }
     return True, functionInfo
 
 if __name__ == '__main__':
     logger.info('Target: %s' % (jsonFilesPath))
 
-    jsonFiles = findJsonFileByDir(jsonFilesPath)
+    jsonFiles = getFileListsWithExtension(jsonFilesPath, ['.json'])
     logger.info('Found ' + str(len(jsonFiles)) + ' JSON files')
 
     errorCount = 0
@@ -248,7 +445,9 @@ if __name__ == '__main__':
     functionInfoInOne = []
     # for jsonFile in tqdm.tqdm(jsonFiles):
     for idx, jsonFile in enumerate(jsonFiles):
-        # if not jsonFile.endswith('0312545ee856018019ea44fcc5308dc8.json'):
+        # if not jsonFile.endswith('c0b1092e623dc9ba0e3c9c2a4ca8e6dd.json'):
+        #     continue
+        # if idx <= 1624:
         #     continue
         logger.info('[%d/%d]: %s' % (idx, len(jsonFiles), jsonFile))
         result, functionInfo = handleOneJsonFile(jsonFile)
